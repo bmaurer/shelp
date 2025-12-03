@@ -10,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 import re
+import shutil
+import datetime
 from pathlib import Path
 
 # SHELP_PROMPT_START
@@ -161,15 +163,21 @@ def get_prompt_for_file(file_path):
     return None, None
 
 
-def call_claude(prompt):
-    """Call claude CLI and return the output."""
+def call_claude(prompt, model=None):
+    """Call claude CLI and return the output. Pipes prompt via stdin."""
+    cmd = ["claude", "-p"]
+    if model:
+        cmd.extend(["--model", model])
+
     try:
         result = subprocess.run(
-            ["claude", "-p", prompt],
+            cmd,
+            input=prompt,
             capture_output=True,
             text=True
         )
         if result.returncode != 0:
+            # Only show stderr on error
             print(f"Error from claude: {result.stderr}", file=sys.stderr)
             sys.exit(1)
         return result.stdout.strip()
@@ -384,15 +392,15 @@ def confirm_script(script_content, prompt):
         return False, None
 
 
-def generate_oneliner(args):
+def generate_oneliner(args, model=None):
     """Generate a one-liner command."""
     user_request = " ".join(args.prompt)
     prompt = build_oneliner_prompt(user_request)
-    result = call_claude(prompt)
+    result = call_claude(prompt, model)
     print(result)
 
 
-def generate_script(args):
+def generate_script(args, model=None):
     """Generate a full script with -o option."""
     output_file = args.output
     user_request = " ".join(args.prompt)
@@ -401,7 +409,7 @@ def generate_script(args):
     prompt = build_script_prompt(user_request, language_hint)
 
     while True:
-        script = call_claude(prompt)
+        script = call_claude(prompt, model)
         script_with_prompt = embed_prompt_in_script(script, user_request)
 
         confirmed, new_prompt = confirm_script(script_with_prompt, user_request)
@@ -420,7 +428,7 @@ def generate_script(args):
             prompt = build_script_prompt(user_request, language_hint)
 
 
-def compile_script(args):
+def compile_script(args, model=None):
     """Compile from a -PROMPT.md file."""
     prompt_file = Path(args.compile)
     if not prompt_file.exists():
@@ -442,7 +450,7 @@ def compile_script(args):
     prompt = build_script_prompt(user_request, language_hint)
 
     while True:
-        script = call_claude(prompt)
+        script = call_claude(prompt, model)
         # Don't embed prompt for compile mode - use the PROMPT.md file
 
         confirmed, new_prompt = confirm_script(script, user_request)
@@ -460,7 +468,7 @@ def compile_script(args):
             prompt = build_script_prompt(user_request, language_hint)
 
 
-def improve_script(args):
+def improve_script(args, model=None):
     """Improve an existing script."""
     if args.improve == "" or args.improve is None:
         # Improve shelp itself
@@ -495,10 +503,9 @@ def improve_script(args):
     prompt = build_improve_prompt(original_prompt, current_script, new_prompt, changelog)
 
     while True:
-        script = call_claude(prompt)
+        script = call_claude(prompt, model)
 
         # Update changelog
-        import datetime
         new_changelog = changelog + f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}] Improved\n"
 
         if prompt_type == "embedded":
@@ -521,7 +528,7 @@ def improve_script(args):
                                          new_prompt, changelog)
 
 
-def tweak_script(args):
+def tweak_script(args, model=None):
     """Tweak an existing script with minimal changes."""
     if args.tweak == "" or args.tweak is None:
         script_path = get_real_script_path()
@@ -571,9 +578,8 @@ def tweak_script(args):
                                 tweak_instructions, changelog)
 
     while True:
-        script = call_claude(prompt)
+        script = call_claude(prompt, model)
 
-        import datetime
         new_changelog = changelog + f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}] Tweaked: {tweak_instructions[:50]}...\n"
 
         if prompt_type == "embedded":
@@ -677,6 +683,17 @@ USAGE
   shelp --prompt [file]            Show the prompt that created a file
   shelp --install [dir]            Install shelp to a directory
 
+OPTIONS
+  -o, --output FILE    Write output to FILE (creates executable)
+  --compile FILE       Compile from FILE-PROMPT.md
+  --improve [FILE]     Improve existing script (default: shelp)
+  --tweak [FILE]       Tweak existing script
+  --prompt [FILE]      Show prompt for FILE (default: shelp)
+  --install [DIR]      Install to DIR (default: ~/bin)
+  --model MODEL        Use specified Claude model
+  --opus               Use claude-opus-4-5 model
+  --help               Show this help
+
 EXAMPLES
 
   Quick One-Liners:
@@ -704,14 +721,10 @@ EXAMPLES
   shelp --tweak myscript.sh       # Quick tweaks without full rewrite
   shelp --improve                 # Improve shelp itself!
 
-OPTIONS
-  -o, --output FILE    Write output to FILE (creates executable)
-  --compile FILE       Compile from FILE-PROMPT.md
-  --improve [FILE]     Improve existing script (default: shelp)
-  --tweak [FILE]       Tweak existing script
-  --prompt [FILE]      Show prompt for FILE (default: shelp)
-  --install [DIR]      Install to DIR (default: ~/bin)
-  --help               Show this help
+  Using Different Models:
+  ───────────────────────
+  shelp --opus find memory leaks in this process
+  shelp --model claude-sonnet-4-5-20250929 optimize this query
 
 """
     print(help_text)
@@ -729,21 +742,29 @@ def main():
                         help="Show prompt for a file")
     parser.add_argument("--install", nargs="?", const="",
                         help="Install shelp")
+    parser.add_argument("--model", help="Claude model to use")
+    parser.add_argument("--opus", action="store_true",
+                        help="Use claude-opus-4-5 model")
     parser.add_argument("--help", action="store_true", help="Show help")
     parser.add_argument("prompt", nargs="*", help="The prompt/description")
 
     args = parser.parse_args()
+
+    # Determine model
+    model = args.model
+    if args.opus:
+        model = "claude-opus-4-5"
 
     if args.help:
         show_help()
     elif args.install is not None:
         install_shelp(args)
     elif args.compile:
-        compile_script(args)
+        compile_script(args, model)
     elif args.improve is not None:
-        improve_script(args)
+        improve_script(args, model)
     elif args.tweak is not None:
-        tweak_script(args)
+        tweak_script(args, model)
     elif args.prompt_file is not None:
         show_prompt(args)
     elif args.output:
@@ -751,9 +772,9 @@ def main():
             print("Error: Please provide a description for the script",
                   file=sys.stderr)
             sys.exit(1)
-        generate_script(args)
+        generate_script(args, model)
     elif args.prompt:
-        generate_oneliner(args)
+        generate_oneliner(args, model)
     else:
         show_help()
 

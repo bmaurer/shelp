@@ -48,6 +48,10 @@ first modify the user's prompt, as per the tweak, then use the modified tweak as
 improvement. The user will make tweaks above teh commented area since that is where
 their cursor will be. Be sure to add a few blank lines for them.
 
+In both improve and tweak modes, strive to make incremental edits to the script. Don't
+write it from scratch, but update based on the changes. In tweak mode, also strive to
+incrementally update the prompt based on the user's requests.
+
 --prompt <file> should output the prompt that created the file. If the file is empty
 output shelp's prompt. include the changelog.
 
@@ -57,8 +61,14 @@ output shelp's prompt. include the changelog.
 offer to add <arg> to the PATH in bashrc if it's not already there. if not arg is specified
 use ~/bin. if the directory doesn't exist, create it.
 
+--model <arg> will pass the given model to claude as --model.
+--opus will act as --model claude-opus-4-5
+
 `claude` will output text to stderr that you do not need and should not be displayed
 to the user only display the output of claude's stderr if it returns a non-zero exit code.
+
+don't pass long arguments to claude. instead, you can pipe content
+to stdin, as you would with cat foo | claude -p.
 
 Ensure an expressive prompt is given to the ai. the AI should generally choose
 bash and classic unix tools or python, but could use perl one liners if really
@@ -69,12 +79,19 @@ had called:
 
 shelp --compile shelp-PROMPT.md.
 
-Then output a brief description of how to use shelp that encourages the user to take next steps,
-start with basic examples that output commands to stdout, then build up to outputting files and
-finally to compilation. Make the examples engaging and realistic to show the value of shelp.
+Output a README.md file that explains how to build and use shelp (including instructions to bootstrap
+by running cat shelp-PROMPT.md | claude --model claude-opus-4-5 -p). This readme should be updated for
+major changes to shelp made with tweak or improve.
+
+As the last step of this bootstrap, output a brief description of how to use shelp that encourages the user
+to take next steps.
+* Start with basic examples that output commands to stdout
+* Build up to outputting files
+* Finally cover compilation
+
+Make the examples engaging and realistic to show the value of shelp.
 
 Finally, encourage the user to use --install to install shelp.
 
-Keep in mind that you are outputting to
-a terminal. Keep output to less than 100 characters per line. You can't use markdown, but
-emoji will work.
+Keep in mind that you are outputting to a terminal. Keep output to less than 100 characters per
+line. You can't use markdown, but emoji will work.
