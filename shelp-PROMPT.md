@@ -150,3 +150,10 @@ shelp --compile shelp-PROMPT.md
    - Cover compilation mode
    - Make examples engaging and realistic
    - Encourage using `--install`
+
+
+---
+
+## Changelog
+
+[2025-12-03 13:38] Tweaked: claude doesn't always output the entire script as ...

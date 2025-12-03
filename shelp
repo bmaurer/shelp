@@ -5,6 +5,7 @@ Generates shell commands and scripts using Claude AI
 """
 
 import argparse
+import difflib
 import os
 import subprocess
 import sys
@@ -137,8 +138,23 @@ def update_prompt_file_changelog(prompt_file, new_prompt, changelog_entry):
     prompt_file.write_text(new_content)
 
 
-def call_claude(prompt, model=None):
-    """Call claude CLI and return the output. Pipes prompt via stdin."""
+def call_claude(prompt, model=None, output_file=None):
+    """Call claude CLI and return the output. Uses temp file for reliable output."""
+    # Create a temp file for claude to write to
+    if output_file is None:
+        fd, output_file = tempfile.mkstemp(suffix=".txt", prefix="shelp_output_")
+        os.close(fd)
+        cleanup_output = True
+    else:
+        cleanup_output = False
+
+    # Build the prompt that instructs claude to write to the file
+    file_prompt = f"""{prompt}
+
+IMPORTANT: Write your output to this file: {output_file}
+Do not output the content to stdout - write it directly to the file.
+After writing, output only the text "DONE" to confirm completion."""
+
     cmd = ["claude", "-p"]
     if model:
         cmd.extend(["--model", model])
@@ -146,18 +162,34 @@ def call_claude(prompt, model=None):
     try:
         result = subprocess.run(
             cmd,
-            input=prompt,
+            input=file_prompt,
             capture_output=True,
             text=True
         )
         if result.returncode != 0:
             # Only show stderr on error
             print(f"Error from claude: {result.stderr}", file=sys.stderr)
+            if cleanup_output and os.path.exists(output_file):
+                os.unlink(output_file)
             sys.exit(1)
-        return result.stdout.strip()
+
+        # Read the output from the file
+        try:
+            with open(output_file, 'r') as f:
+                content = f.read().strip()
+        except FileNotFoundError:
+            # Fall back to stdout if file wasn't created
+            content = result.stdout.strip()
+
+        if cleanup_output and os.path.exists(output_file):
+            os.unlink(output_file)
+
+        return content
     except FileNotFoundError:
         print("Error: 'claude' command not found. Please install Claude CLI.",
               file=sys.stderr)
+        if cleanup_output and os.path.exists(output_file):
+            os.unlink(output_file)
         sys.exit(1)
 
 
@@ -258,7 +290,14 @@ Your task:
 IMPORTANT: The output should be an evolution of the existing script, not a complete rewrite.
 Make minimal, targeted changes to implement the new requirements.
 
-Output only the new script content, no markdown code blocks or explanations."""
+OUTPUT FORMAT:
+First, output a brief summary of the changes you made (2-5 bullet points), wrapped like this:
+---SUMMARY_START---
+- Change 1
+- Change 2
+---SUMMARY_END---
+
+Then output the complete updated script content (no markdown code blocks)."""
 
 
 def build_tweak_prompt(original_prompt, current_script, tweak_instructions, changelog):
@@ -292,7 +331,14 @@ Only modify the specific parts that need to change.
 IMPORTANT: Both the prompt update and script update should be evolutions, not rewrites.
 Keep the same language (bash/python) unless the changes necessitate otherwise.
 
-Output only the new script content, no markdown code blocks or explanations."""
+OUTPUT FORMAT:
+First, output a brief summary of the changes you made (2-5 bullet points), wrapped like this:
+---SUMMARY_START---
+- Change 1
+- Change 2
+---SUMMARY_END---
+
+Then output the complete updated script content (no markdown code blocks)."""
 
 
 def embed_prompt_in_script(script_content, prompt, changelog=""):
@@ -357,6 +403,92 @@ def strip_embedded_prompt(script_content):
     return script_content
 
 
+def is_in_git_repo(file_path):
+    """Check if a file is inside a git repository."""
+    file_path = Path(file_path).resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(file_path.parent), "rev-parse", "--git-dir"],
+            capture_output=True,
+            text=True
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def git_commit_files(files, message):
+    """Commit the specified files with the given message."""
+    if not files:
+        return False
+
+    first_file = Path(files[0]).resolve()
+    git_dir = first_file.parent
+
+    try:
+        # Add the files
+        for f in files:
+            subprocess.run(
+                ["git", "-C", str(git_dir), "add", str(Path(f).resolve())],
+                check=True,
+                capture_output=True
+            )
+
+        # Commit
+        result = subprocess.run(
+            ["git", "-C", str(git_dir), "commit", "-m", message],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            print(f"✓ Committed changes: {message}")
+            return True
+        else:
+            print(f"Git commit failed: {result.stderr}", file=sys.stderr)
+            return False
+    except subprocess.CalledProcessError as e:
+        print(f"Git error: {e}", file=sys.stderr)
+        return False
+    except FileNotFoundError:
+        print("Git not found", file=sys.stderr)
+        return False
+
+
+def generate_diff(old_content, new_content, filename="script"):
+    """Generate a unified diff between old and new content."""
+    old_lines = old_content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+
+    diff = difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"a/{filename}",
+        tofile=f"b/{filename}",
+        lineterm=""
+    )
+    return "".join(diff)
+
+
+def parse_summary_and_script(output):
+    """Parse the AI output to extract summary and script content."""
+    summary = ""
+    script = output
+
+    # Look for summary markers
+    summary_match = re.search(
+        r'---SUMMARY_START---\s*\n(.+?)\n---SUMMARY_END---',
+        output,
+        re.DOTALL
+    )
+    if summary_match:
+        summary = summary_match.group(1).strip()
+        # Get everything after the summary end marker
+        after_summary = output[summary_match.end():].strip()
+        if after_summary:
+            script = after_summary
+
+    return summary, script
+
+
 def confirm_script(script_content, prompt):
     """Show script to user and confirm it's OK. Returns (confirmed, new_prompt)."""
     display_script = strip_embedded_prompt(script_content)
@@ -378,6 +510,61 @@ def confirm_script(script_content, prompt):
     else:
         print("Aborting.")
         return False, None
+
+
+def confirm_changes(script_content, old_script, summary, script_path, prompt_file=None, prompt=None):
+    """
+    Show summary and diff for improve/tweak mode.
+    Returns (action, new_prompt) where action is 'accept', 'commit', 'abort', or 'edit'.
+    """
+    display_script = strip_embedded_prompt(script_content)
+    display_old = strip_embedded_prompt(old_script)
+
+    # Show summary first
+    if summary:
+        print("\n" + "=" * 60)
+        print("Summary of changes:")
+        print("=" * 60)
+        print(summary)
+
+    # Show diff
+    print("\n" + "=" * 60)
+    print("Diff:")
+    print("=" * 60)
+    diff = generate_diff(display_old, display_script, script_path.name)
+    if diff:
+        print(diff)
+    else:
+        print("(no changes)")
+    print("=" * 60)
+
+    # Check if in git repo for commit option
+    in_git = is_in_git_repo(script_path)
+
+    if in_git:
+        options = "[Y]es / [c]ommit / [n]o / [e]dit prompt"
+        response = input(f"\nAccept changes? {options} ").strip().lower()
+    else:
+        options = "[Y]es / [n]o / [e]dit prompt"
+        response = input(f"\nAccept changes? {options} ").strip().lower()
+
+    if response in ("", "y", "yes"):
+        return "accept", prompt
+    elif response in ("c", "commit") and in_git:
+        return "commit", prompt
+    elif response in ("e", "edit"):
+        if prompt:
+            new_prompt = open_in_editor(prompt)
+            if new_prompt.strip() == prompt.strip():
+                print("Prompt unchanged. Aborting.")
+                return "abort", None
+            return "edit", new_prompt
+        else:
+            print("No prompt to edit in this mode.")
+            return "abort", None
+    else:
+        print("Aborting.")
+        return "abort", None
 
 
 def generate_oneliner(args, model=None):
@@ -487,11 +674,17 @@ def improve_script(args, model=None):
         print("Prompt unchanged. Aborting.")
         return
 
+    # Get prompt file for compile mode
+    prompt_file = get_prompt_file_for_script(script_path) if prompt_type == "compile" else None
+
     # Generate improved script
-    prompt = build_improve_prompt(original_prompt, current_script, new_prompt, changelog)
+    ai_prompt = build_improve_prompt(original_prompt, current_script, new_prompt, changelog)
 
     while True:
-        script = call_claude(prompt, model)
+        output = call_claude(ai_prompt, model)
+
+        # Parse summary and script from output
+        summary, script = parse_summary_and_script(output)
 
         # Update changelog
         new_changelog = changelog + f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}] Improved\n"
@@ -499,22 +692,40 @@ def improve_script(args, model=None):
         if prompt_type == "embedded":
             script = embed_prompt_in_script(script, new_prompt, new_changelog)
 
-        confirmed, edited_prompt = confirm_script(script, new_prompt)
-        if confirmed is True:
+        action, edited_prompt = confirm_changes(
+            script, current_script, summary, script_path,
+            prompt_file=prompt_file, prompt=new_prompt
+        )
+
+        if action == "accept":
             script_path.write_text(script)
             script_path.chmod(0o755)
-            if prompt_type == "compile":
-                prompt_file = get_prompt_file_for_script(script_path)
+            if prompt_type == "compile" and prompt_file:
                 changelog_entry = f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}] Improved\n"
                 update_prompt_file_changelog(prompt_file, new_prompt, changelog_entry)
             print(f"\n✓ Script improved: {script_path}")
             break
-        elif confirmed is False:
+        elif action == "commit":
+            script_path.write_text(script)
+            script_path.chmod(0o755)
+            files_to_commit = [str(script_path)]
+            if prompt_type == "compile" and prompt_file:
+                changelog_entry = f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}] Improved\n"
+                update_prompt_file_changelog(prompt_file, new_prompt, changelog_entry)
+                files_to_commit.append(str(prompt_file))
+            print(f"\n✓ Script improved: {script_path}")
+            # Commit the changes
+            commit_msg = f"shelp: improve {script_path.name}"
+            if summary:
+                commit_msg += f"\n\n{summary}"
+            git_commit_files(files_to_commit, commit_msg)
             break
-        else:
+        elif action == "abort":
+            break
+        else:  # action == "edit"
             new_prompt = edited_prompt
-            prompt = build_improve_prompt(original_prompt, current_script,
-                                         new_prompt, changelog)
+            ai_prompt = build_improve_prompt(original_prompt, current_script,
+                                             new_prompt, changelog)
 
 
 def tweak_script(args, model=None):
@@ -536,6 +747,9 @@ def tweak_script(args, model=None):
         sys.exit(1)
 
     changelog = extract_changelog(script_path) or ""
+
+    # Get prompt file for compile mode
+    prompt_file = get_prompt_file_for_script(script_path) if prompt_type == "compile" else None
 
     # Prepare tweak editor content
     commented_prompt = "\n".join(f"# {line}" for line in original_prompt.split("\n"))
@@ -563,31 +777,49 @@ def tweak_script(args, model=None):
         return
 
     # Generate tweaked script
-    prompt = build_tweak_prompt(original_prompt, current_script,
-                                tweak_instructions, changelog)
+    ai_prompt = build_tweak_prompt(original_prompt, current_script,
+                                   tweak_instructions, changelog)
 
     while True:
-        script = call_claude(prompt, model)
+        output = call_claude(ai_prompt, model)
+
+        # Parse summary and script from output
+        summary, script = parse_summary_and_script(output)
 
         new_changelog = changelog + f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}] Tweaked: {tweak_instructions[:50]}...\n"
 
         if prompt_type == "embedded":
             script = embed_prompt_in_script(script, original_prompt, new_changelog)
 
-        confirmed, _ = confirm_script(script, original_prompt)
-        if confirmed is True:
+        action, _ = confirm_changes(
+            script, current_script, summary, script_path,
+            prompt_file=prompt_file, prompt=None  # No prompt editing in tweak mode
+        )
+
+        if action == "accept":
             script_path.write_text(script)
             script_path.chmod(0o755)
-            if prompt_type == "compile":
-                prompt_file = get_prompt_file_for_script(script_path)
+            if prompt_type == "compile" and prompt_file:
                 changelog_entry = f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}] Tweaked: {tweak_instructions[:50]}...\n"
                 update_prompt_file_changelog(prompt_file, original_prompt, changelog_entry)
             print(f"\n✓ Script tweaked: {script_path}")
             break
-        elif confirmed is False:
+        elif action == "commit":
+            script_path.write_text(script)
+            script_path.chmod(0o755)
+            files_to_commit = [str(script_path)]
+            if prompt_type == "compile" and prompt_file:
+                changelog_entry = f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}] Tweaked: {tweak_instructions[:50]}...\n"
+                update_prompt_file_changelog(prompt_file, original_prompt, changelog_entry)
+                files_to_commit.append(str(prompt_file))
+            print(f"\n✓ Script tweaked: {script_path}")
+            # Commit the changes
+            commit_msg = f"shelp: tweak {script_path.name} - {tweak_instructions[:50]}"
+            if summary:
+                commit_msg += f"\n\n{summary}"
+            git_commit_files(files_to_commit, commit_msg)
             break
-        else:
-            # For tweak, don't allow re-editing the prompt
+        else:  # action == "abort" or "edit" (edit not available in tweak mode)
             print("Aborting.")
             break
 
