@@ -9,8 +9,7 @@ Generate shell commands and scripts from natural language using Claude AI.
 If you don't have `shelp` yet, build it from the prompt file:
 
 ```bash
-cat shelp-PROMPT.md | claude --model claude-opus-4-5 -p > shelp
-chmod +x shelp
+cat shelp-PROMPT.md | claude --model claude-opus-4-5 -p
 ```
 
 Or if you already have shelp, you can rebuild it:
