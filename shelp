@@ -15,79 +15,13 @@ import datetime
 from pathlib import Path
 
 # SHELP_PROMPT_START
-# This is the prompt that created shelp. Do not modify this section manually.
+# This script was built with: shelp --compile shelp-PROMPT.md
+# The prompt lives in shelp-PROMPT.md alongside this script.
 # To improve shelp, use: shelp --improve
-SHELP_PROMPT = r'''You are a expert programmer.
-
-Write a script that uses AI to write shell helpers. You can use
-`claude -p "prompt"` which will echo the output of a prompt on the
-command line. the command is called shelp (shell help). You're welcome to write
-it in bash or python.
-
-If you write:
-
-shelp split input by commas and output in lines with @meta.com added to each item
-
-it would echo to stdout a one liner that does that. it should be a bash
-command, but could use python -c if it's the best way to do it.
-
-if you use shelp -o <output> <prompt>  it will use compile mode. instead of outputting
- in one liner style it will output a ready to run executable. In this case,
- prompt the AI to be more expressive in how it writes. The file should be made
- executable. in this case it can use either bash or python (though if the output name
- is .sh or .py it should use the appropriate language).
-
-if -o is passed, still echo the script to stdout, and prompt the user if the
-script looks ok before outputting the file. If they say no, open the prompt in
-EDITOR allow them to modify it. If they don't change the file, simply abort otherwise use
-the modified prompt.
-
-if the user passes --compile, <command>-PROMPT.md read the prompt from that file
-and output to <command>.
-
-If the user calls shelp --improve <file>, it should allow the to improve the
-prompt of the saved file. In other words, open an EDITOR with the prompt that
-created the file and edit it. When the AI is called, you should share with it
-the unimproved shell script as well as the user's updated prompt as context.'
-You should also keep a changelog as you --improve the file.
-
-If the user calls shelp --improve, you should improve shelp itself.
-
-To implement improvement, you'll need to have the script's prompt. If the script was
-built with --compile, use the PROMPT.md file. On the other hand, when using -o, output
-the prompt, verbatim inside the script itself. Do not output this metadata when showing
-the user the file for confirmation. Remember that the script (including shelp's path)
-might be a symlink so resolve the real path to look for the prompt.
-
---tweak is a variant of improve that also takes an optional argument. it still
-opens an editor with the prompt, but the prompt is commented out. There are further
-comments explaining to the user that they only need to explain what they would like
-to edit about the prompt. In this case, the prompt to claude should instruct claude to
-first modify the user's prompt, as per the tweak, then use the modified tweak as the
-improvement. The user will make tweaks above teh commented area since that is where
-their cursor will be. Be sure to add a few blank lines for them.
-
---prompt <file> should output the prompt that created the file. If the file is empty
-output shelp's prompt. include the changelog.
-
---help gives a detailed description of how to use shelp with examples.
-
---install <arg> it should install itself into the <arg> directory and
-offer to add <arg> to the PATH in bashrc if it's not already there. if not arg is specified
-use ~/bin. if the directory doesn't exist, create it.
-
-`claude` will output text to stderr that you do not need and should not be displayed
-to the user only display the output of claude's stderr if it returns a non-zero exit code.
-
-Ensure an expressive prompt is given to the ai. the AI should generally choose
-bash and classic unix tools or python, but could use perl one liners if really
-helpful.'''
 # SHELP_PROMPT_END
 
 # SHELP_CHANGELOG_START
-# Changelog for shelp improvements
-SHELP_CHANGELOG = r'''
-'''
+# Changelog is maintained in shelp-PROMPT.md
 # SHELP_CHANGELOG_END
 
 
@@ -130,8 +64,26 @@ def extract_embedded_prompt(script_path):
 
 
 def extract_changelog(script_path):
-    """Extract the changelog from a script file."""
+    """Extract the changelog from a script file or its PROMPT.md file."""
     script_path = Path(script_path).resolve()
+
+    # First check for changelog in PROMPT.md file (compiled mode)
+    prompt_file = get_prompt_file_for_script(script_path)
+    if prompt_file.exists():
+        try:
+            content = prompt_file.read_text()
+            # Look for changelog section at the end of PROMPT.md
+            match = re.search(
+                r'\n---\n\n## Changelog\n(.+)$',
+                content,
+                re.DOTALL
+            )
+            if match:
+                return match.group(1).strip()
+        except Exception:
+            pass
+
+    # Check for embedded changelog in script
     try:
         content = script_path.read_text()
         match = re.search(
@@ -153,7 +105,11 @@ def get_prompt_for_file(file_path):
     # Check for -PROMPT.md file first (compiled mode)
     prompt_file = get_prompt_file_for_script(file_path)
     if prompt_file.exists():
-        return prompt_file.read_text(), "compile"
+        content = prompt_file.read_text()
+        # Strip changelog section from prompt if present
+        if '\n---\n\n## Changelog\n' in content:
+            content = content.split('\n---\n\n## Changelog\n')[0]
+        return content, "compile"
 
     # Check for embedded prompt
     embedded = extract_embedded_prompt(file_path)
@@ -161,6 +117,24 @@ def get_prompt_for_file(file_path):
         return embedded, "embedded"
 
     return None, None
+
+
+def update_prompt_file_changelog(prompt_file, new_prompt, changelog_entry):
+    """Update a PROMPT.md file with new prompt and changelog entry."""
+    prompt_file = Path(prompt_file)
+
+    # Get existing changelog
+    existing_changelog = ""
+    if prompt_file.exists():
+        content = prompt_file.read_text()
+        match = re.search(r'\n---\n\n## Changelog\n(.+)$', content, re.DOTALL)
+        if match:
+            existing_changelog = match.group(1)
+
+    # Build new content
+    new_changelog = existing_changelog + changelog_entry
+    new_content = f"{new_prompt}\n\n---\n\n## Changelog\n{new_changelog}"
+    prompt_file.write_text(new_content)
 
 
 def call_claude(prompt, model=None):
@@ -275,9 +249,14 @@ EXISTING CHANGELOG:
 {changelog if changelog else "(none)"}
 
 Your task:
-1. Generate an improved version of the script based on the updated prompt
-2. Maintain backwards compatibility where possible
-3. Keep the same language (bash/python) unless the new requirements necessitate a change
+1. Make INCREMENTAL edits to the existing script based on the updated prompt
+2. Do NOT rewrite from scratch - preserve existing code structure and style
+3. Only modify the specific parts that need to change for the new requirements
+4. Maintain backwards compatibility where possible
+5. Keep the same language (bash/python) unless the new requirements necessitate a change
+
+IMPORTANT: The output should be an evolution of the existing script, not a complete rewrite.
+Make minimal, targeted changes to implement the new requirements.
 
 Output only the new script content, no markdown code blocks or explanations."""
 
@@ -298,11 +277,20 @@ USER'S TWEAK INSTRUCTIONS:
 EXISTING CHANGELOG:
 {changelog if changelog else "(none)"}
 
-Your task:
-1. First, mentally update the original prompt based on the user's tweak instructions
-2. Then generate an improved version of the script based on that updated prompt
-3. Maintain backwards compatibility where possible
-4. Keep the same language (bash/python) unless the changes necessitate otherwise
+Your task (two-phase approach):
+
+PHASE 1 - Update the prompt:
+First, incrementally modify the original prompt based on the user's tweak instructions.
+Make minimal, targeted additions or modifications to the prompt text.
+Do NOT rewrite the prompt from scratch.
+
+PHASE 2 - Update the script:
+Then, make incremental edits to the existing script to implement the tweaked requirements.
+Do NOT rewrite the script from scratch - preserve existing code structure and style.
+Only modify the specific parts that need to change.
+
+IMPORTANT: Both the prompt update and script update should be evolutions, not rewrites.
+Keep the same language (bash/python) unless the changes necessitate otherwise.
 
 Output only the new script content, no markdown code blocks or explanations."""
 
@@ -517,7 +505,8 @@ def improve_script(args, model=None):
             script_path.chmod(0o755)
             if prompt_type == "compile":
                 prompt_file = get_prompt_file_for_script(script_path)
-                prompt_file.write_text(new_prompt)
+                changelog_entry = f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}] Improved\n"
+                update_prompt_file_changelog(prompt_file, new_prompt, changelog_entry)
             print(f"\n✓ Script improved: {script_path}")
             break
         elif confirmed is False:
@@ -589,6 +578,10 @@ def tweak_script(args, model=None):
         if confirmed is True:
             script_path.write_text(script)
             script_path.chmod(0o755)
+            if prompt_type == "compile":
+                prompt_file = get_prompt_file_for_script(script_path)
+                changelog_entry = f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}] Tweaked: {tweak_instructions[:50]}...\n"
+                update_prompt_file_changelog(prompt_file, original_prompt, changelog_entry)
             print(f"\n✓ Script tweaked: {script_path}")
             break
         elif confirmed is False:

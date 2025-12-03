@@ -1,97 +1,152 @@
-You are a expert programmer.
+# shelp: AI-Powered Shell Script Generator
 
-Write a script that uses AI to write shell helpers. You can use
-`claude -p "prompt"` which will echo the output of a prompt on the
-command line. the command is called shelp (shell help). You're welcome to write
-it in bash or python.
+You are an expert programmer. Write a script called `shelp` (shell help) that uses AI to generate shell commands and scripts.
 
-If you write:
+## Core Mechanism
 
-shelp split input by commas and output in lines with @meta.com added to each item
+The script uses the `claude` CLI tool to generate output:
+```bash
+claude -p "prompt"
+```
 
-it would echo to stdout a one liner that does that. it should be a bash
-command, but could use python -c if it's the best way to do it.
+For long prompts, pipe content to stdin instead of passing as arguments:
+```bash
+cat foo | claude -p
+```
 
-if you use shelp -o <output> <prompt>  it will use compile mode. instead of outputting
- in one liner style it will output a ready to run executable. In this case,
- prompt the AI to be more expressive in how it writes. The file should be made
- executable. in this case it can use either bash or python (though if the output name
- is .sh or .py it should use the appropriate language).
+**Important:** The `claude` command outputs progress text to stderr. Only display stderr if claude returns a non-zero exit code.
 
-if -o is passed, still echo the script to stdout, and prompt the user if the
-script looks ok before outputting the file. If they say no, open the prompt in
-EDITOR allow them to modify it. If they don't change the file, simply abort otherwise use
-the modified prompt.
+---
 
-if the user passes --compile, <command>-PROMPT.md read the prompt from that file
-and output to <command>.
+## Basic Usage (One-Liner Mode)
 
-If the user calls shelp --improve <file>, it should allow the to improve the
-prompt of the saved file. In other words, open an EDITOR with the prompt that
-created the file and edit it. When the AI is called, you should share with it
-the unimproved shell script as well as the user's updated prompt as context.'
-You should also keep a changelog as you --improve the file.
+When called with just a prompt: 
+```bash
+$ shelp split input by commas and output in lines with @meta.com added to each item
+tr ',' '\n' | sed 's/^[ \t]*//; s/[ \t]*$//' | sed 's/$/@meta.com/'
+```
 
-If the user calls shelp --improve, you should improve shelp itself.
+Output a bash one-liner to stdout that accomplishes the task. The one-liner may use `python -c` if that's the cleanest solution. Just output a copyable shell command, no markdown.
 
-To implement improvement, you'll need to have the script's prompt. If the script was
-built with --compile, use the PROMPT.md file. On the other hand, when using -o, output
-the prompt, verbatim inside the script itself. Do not output this metadata when showing
-the user the file for confirmation. Remember that the script (including shelp's path)
-might be a symlink so resolve the real path to look for the prompt.
+---
 
---tweak is a variant of improve that also takes an optional argument. it still
-opens an editor with the prompt, but the prompt is commented out. There are further
-comments explaining to the user that they only need to explain what they would like
-to edit about the prompt. In this case, the prompt to claude should instruct claude to
-first modify the user's prompt, as per the tweak, then use the modified tweak as the
-improvement. The user will make tweaks above teh commented area since that is where
-their cursor will be. Be sure to add a few blank lines for them.
+## Output Modes
 
-In both improve and tweak modes, strive to make incremental edits to the script. Don't
-write it from scratch, but update based on the changes. In tweak mode, also strive to
-incrementally update the prompt based on the user's requests.
+### File Output Mode (`-o <output>`)
 
---prompt <file> should output the prompt that created the file. If the file is empty
-output shelp's prompt. include the changelog.
+```bash
+shelp -o myscript.sh "process log files and extract errors"
+```
 
---help gives a detailed description of how to use shelp with examples.
+Behavior:
+1. Generate a full, well-commented executable script (not a one-liner)
+2. Echo the script to stdout for user review
+3. Prompt the user to confirm the script looks OK
+4. If confirmed: write to file and make it executable
+5. If rejected: open the prompt in `$EDITOR` for modification
+   - If the user saves changes: regenerate with the modified prompt
+   - If unchanged: abort
 
---install <arg> it should install itself into the <arg> directory and
-offer to add <arg> to the PATH in bashrc if it's not already there. if not arg is specified
-use ~/bin. if the directory doesn't exist, create it.
+Language selection:
+- `.sh` extension → bash
+- `.py` extension → python
+- No extension → AI chooses (prefer bash/python, perl one-liners OK if helpful)
 
---model <arg> will pass the given model to claude as --model.
---opus will act as --model claude-opus-4-5
+**Prompt storage:** Embed the original prompt verbatim inside the generated script (as a comment). This metadata should NOT be shown during the confirmation step.
 
-`claude` will output text to stderr that you do not need and should not be displayed
-to the user only display the output of claude's stderr if it returns a non-zero exit code.
+### Compile Mode (`--compile <command>-PROMPT.md`)
 
-don't pass long arguments to claude. instead, you can pipe content
-to stdin, as you would with cat foo | claude -p.
+```bash
+shelp --compile myscript-PROMPT.md
+```
 
-Ensure an expressive prompt is given to the ai. the AI should generally choose
-bash and classic unix tools or python, but could use perl one liners if really
-helpful.
+Reads the prompt from `<command>-PROMPT.md` and outputs to `<command>` (executable). The script metadata should point at the prompt MD file rather than embed the prompt itself.
 
-Now it's time to build shelp. Since shelp doesn't exist you'll have to build it as if the user
-had called:
+---
 
-shelp --compile shelp-PROMPT.md.
+## Improvement Modes
 
-Output a README.md file that explains how to build and use shelp (including instructions to bootstrap
-by running cat shelp-PROMPT.md | claude --model claude-opus-4-5 -p). This readme should be updated for
-major changes to shelp made with tweak or improve.
+### `--improve <file>`
 
-As the last step of this bootstrap, output a brief description of how to use shelp that encourages the user
-to take next steps.
-* Start with basic examples that output commands to stdout
-* Build up to outputting files
-* Finally cover compilation
+Opens `$EDITOR` with the prompt that created the file. After editing:
+- The AI receives both the current script AND the updated prompt
+- Generates an improved version based on the changes
+- Maintains a changelog within the file
 
-Make the examples engaging and realistic to show the value of shelp.
+**Finding the prompt:**
+- Use the metadata to find the prompt.
+- For `--compile` scripts: read from the corresponding `PROMPT.md` file
+- For `-o` scripts: extract from the embedded prompt in the script
+- **Note:** Resolve symlinks to find the real path when looking for `PROMPT.md` files. they will sit in the real path of the executable.
 
-Finally, encourage the user to use --install to install shelp.
+### `--improve`
 
-Keep in mind that you are outputting to a terminal. Keep output to less than 100 characters per
-line. You can't use markdown, but emoji will work.
+Improves `shelp` itself using its own prompt file.
+
+### `--tweak [file]`
+
+A variant of `--improve` for quick modifications:
+
+1. Opens `$EDITOR` with the prompt commented out
+2. Adds blank lines at the top (cursor starts here)
+3. Includes instructions explaining the user only needs to describe desired changes
+4. The AI first modifies the prompt based on the tweak, then regenerates the script
+
+**For both improve and tweak:** Make incremental edits to the script rather than rewriting from scratch. In tweak mode, also incrementally update the prompt.
+
+---
+
+## Utility Commands
+
+### `--prompt [file]`
+Display the prompt that created the given file (including changelog).
+If no file specified, display shelp's own prompt.
+
+### `--help`
+Show detailed usage instructions with examples.
+
+### `--install [directory]`
+Install shelp to the specified directory (default: `~/bin`).
+- Create the directory if it doesn't exist
+- Offer to add the directory to `PATH` in `.bashrc` if not already present
+
+### `--model <model>`
+Pass the specified model to claude via `--model`.
+
+### `--opus`
+Shorthand for `--model claude-opus-4-5`.
+
+---
+
+## AI Prompting Guidelines
+
+When prompting the AI to generate scripts:
+- Be expressive and clear about requirements
+- Prefer bash and classic Unix tools
+- Python is acceptable when appropriate
+- Perl one-liners are OK if genuinely helpful
+
+---
+
+## Bootstrap Instructions
+
+Since shelp doesn't exist yet, build it as if the user ran:
+```bash
+shelp --compile shelp-PROMPT.md
+```
+
+### Output Requirements
+
+1. **Generate `shelp`** - the executable script
+
+2. **Generate `README.md`** explaining:
+   - How to bootstrap (run `cat shelp-PROMPT.md | claude --model claude-opus-4-5 -p`)
+   - Complete usage instructions
+   - Update this README for major changes made via `--tweak` or `--improve`
+
+3. **Display a terminal-friendly getting-started guide** (max 100 chars/line, no markdown, emoji OK):
+   - Start with basic examples (stdout one-liners)
+   - Progress to file output with `-o`
+   - Cover compilation mode
+   - Make examples engaging and realistic
+   - Encourage using `--install`
