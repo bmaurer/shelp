@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+"""
+shelp - AI-powered shell helper
+Generates shell commands and scripts using Claude AI
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+import re
+from pathlib import Path
+
+# SHELP_PROMPT_START
+# This is the prompt that created shelp. Do not modify this section manually.
+# To improve shelp, use: shelp --improve
+SHELP_PROMPT = r'''You are a expert programmer.
+
+Write a script that uses AI to write shell helpers. You can use
+`claude -p "prompt"` which will echo the output of a prompt on the
+command line. the command is called shelp (shell help). You're welcome to write
+it in bash or python.
+
+If you write:
+
+shelp split input by commas and output in lines with @meta.com added to each item
+
+it would echo to stdout a one liner that does that. it should be a bash
+command, but could use python -c if it's the best way to do it.
+
+if you use shelp -o <output> <prompt>  it will use compile mode. instead of outputting
+ in one liner style it will output a ready to run executable. In this case,
+ prompt the AI to be more expressive in how it writes. The file should be made
+ executable. in this case it can use either bash or python (though if the output name
+ is .sh or .py it should use the appropriate language).
+
+if -o is passed, still echo the script to stdout, and prompt the user if the
+script looks ok before outputting the file. If they say no, open the prompt in
+EDITOR allow them to modify it. If they don't change the file, simply abort otherwise use
+the modified prompt.
+
+if the user passes --compile, <command>-PROMPT.md read the prompt from that file
+and output to <command>.
+
+If the user calls shelp --improve <file>, it should allow the to improve the
+prompt of the saved file. In other words, open an EDITOR with the prompt that
+created the file and edit it. When the AI is called, you should share with it
+the unimproved shell script as well as the user's updated prompt as context.'
+You should also keep a changelog as you --improve the file.
+
+If the user calls shelp --improve, you should improve shelp itself.
+
+To implement improvement, you'll need to have the script's prompt. If the script was
+built with --compile, use the PROMPT.md file. On the other hand, when using -o, output
+the prompt, verbatim inside the script itself. Do not output this metadata when showing
+the user the file for confirmation. Remember that the script (including shelp's path)
+might be a symlink so resolve the real path to look for the prompt.
+
+--tweak is a variant of improve that also takes an optional argument. it still
+opens an editor with the prompt, but the prompt is commented out. There are further
+comments explaining to the user that they only need to explain what they would like
+to edit about the prompt. In this case, the prompt to claude should instruct claude to
+first modify the user's prompt, as per the tweak, then use the modified tweak as the
+improvement. The user will make tweaks above teh commented area since that is where
+their cursor will be. Be sure to add a few blank lines for them.
+
+--prompt <file> should output the prompt that created the file. If the file is empty
+output shelp's prompt. include the changelog.
+
+--help gives a detailed description of how to use shelp with examples.
+
+--install <arg> it should install itself into the <arg> directory and
+offer to add <arg> to the PATH in bashrc if it's not already there. if not arg is specified
+use ~/bin. if the directory doesn't exist, create it.
+
+`claude` will output text to stderr that you do not need and should not be displayed
+to the user only display the output of claude's stderr if it returns a non-zero exit code.
+
+Ensure an expressive prompt is given to the ai. the AI should generally choose
+bash and classic unix tools or python, but could use perl one liners if really
+helpful.'''
+# SHELP_PROMPT_END
+
+# SHELP_CHANGELOG_START
+# Changelog for shelp improvements
+SHELP_CHANGELOG = r'''
+'''
+# SHELP_CHANGELOG_END
+
+
+def get_real_script_path():
+    """Get the real path of the script, resolving symlinks."""
+    return Path(os.path.realpath(__file__))
+
+
+def get_prompt_file_for_script(script_path):
+    """Get the -PROMPT.md file for a compiled script."""
+    script_path = Path(script_path).resolve()
+    prompt_file = script_path.parent / f"{script_path.name}-PROMPT.md"
+    return prompt_file
+
+
+def extract_embedded_prompt(script_path):
+    """Extract the embedded prompt from a script file."""
+    script_path = Path(script_path).resolve()
+    try:
+        content = script_path.read_text()
+        # Look for embedded prompt markers
+        match = re.search(
+            r"# SHELP_PROMPT_START\n.*?SHELP_PROMPT = r'''(.+?)'''",
+            content,
+            re.DOTALL
+        )
+        if match:
+            return match.group(1)
+        # Try alternate format for bash scripts
+        match = re.search(
+            r'# SHELP_PROMPT_START\n# PROMPT: """(.+?)"""',
+            content,
+            re.DOTALL
+        )
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def extract_changelog(script_path):
+    """Extract the changelog from a script file."""
+    script_path = Path(script_path).resolve()
+    try:
+        content = script_path.read_text()
+        match = re.search(
+            r"# SHELP_CHANGELOG_START\n.*?SHELP_CHANGELOG = r'''(.+?)'''",
+            content,
+            re.DOTALL
+        )
+        if match:
+            return match.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
+def get_prompt_for_file(file_path):
+    """Get the prompt that created a file."""
+    file_path = Path(file_path).resolve()
+
+    # Check for -PROMPT.md file first (compiled mode)
+    prompt_file = get_prompt_file_for_script(file_path)
+    if prompt_file.exists():
+        return prompt_file.read_text(), "compile"
+
+    # Check for embedded prompt
+    embedded = extract_embedded_prompt(file_path)
+    if embedded:
+        return embedded, "embedded"
+
+    return None, None
+
+
+def call_claude(prompt):
+    """Call claude CLI and return the output."""
+    try:
+        result = subprocess.run(
+            ["claude", "-p", prompt],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            print(f"Error from claude: {result.stderr}", file=sys.stderr)
+            sys.exit(1)
+        return result.stdout.strip()
+    except FileNotFoundError:
+        print("Error: 'claude' command not found. Please install Claude CLI.",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def open_in_editor(content):
+    """Open content in the user's editor and return the modified content."""
+    editor = os.environ.get("EDITOR", "vim")
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(content)
+        temp_path = f.name
+
+    try:
+        subprocess.run([editor, temp_path])
+        with open(temp_path, "r") as f:
+            return f.read()
+    finally:
+        os.unlink(temp_path)
+
+
+def get_language_hint(output_file):
+    """Get language hint based on output file extension."""
+    if output_file:
+        if output_file.endswith(".sh"):
+            return "bash"
+        elif output_file.endswith(".py"):
+            return "python"
+    return None
+
+
+def build_oneliner_prompt(user_request):
+    """Build the prompt for generating a one-liner command."""
+    return f"""You are an expert shell programmer. Generate a single-line shell command
+that accomplishes the following task:
+
+{user_request}
+
+Requirements:
+- Output ONLY the command itself, no explanation
+- It should be a single line that can be copied and pasted
+- Prefer bash and classic Unix tools (awk, sed, grep, cut, tr, etc.)
+- Use python -c or perl -e if it makes the solution significantly cleaner
+- The command should be ready to use as-is
+
+Output only the command, nothing else."""
+
+
+def build_script_prompt(user_request, language_hint=None):
+    """Build the prompt for generating a full script."""
+    lang_instruction = ""
+    if language_hint == "bash":
+        lang_instruction = "Write the script in bash."
+    elif language_hint == "python":
+        lang_instruction = "Write the script in Python 3."
+    else:
+        lang_instruction = """Choose between bash or Python based on what's most appropriate
+for the task. Use bash for simple file operations and pipelines. Use Python for more
+complex logic, data manipulation, or when better error handling is needed."""
+
+    return f"""You are an expert shell programmer. Create a complete, well-documented
+executable script that accomplishes the following task:
+
+{user_request}
+
+Requirements:
+- {lang_instruction}
+- Include a proper shebang line (#!/usr/bin/env bash or #!/usr/bin/env python3)
+- Add helpful comments explaining the logic
+- Include basic error handling
+- Make it production-ready
+- Use classic Unix tools where appropriate
+- The script should be self-contained and ready to run
+
+Output only the script content, no markdown code blocks or explanations."""
+
+
+def build_improve_prompt(original_prompt, current_script, new_prompt, changelog):
+    """Build the prompt for improving a script."""
+    return f"""You are an expert shell programmer. A user wants to improve an existing script.
+
+ORIGINAL PROMPT THAT CREATED THE SCRIPT:
+{original_prompt}
+
+CURRENT SCRIPT:
+{current_script}
+
+UPDATED PROMPT FROM USER:
+{new_prompt}
+
+EXISTING CHANGELOG:
+{changelog if changelog else "(none)"}
+
+Your task:
+1. Generate an improved version of the script based on the updated prompt
+2. Maintain backwards compatibility where possible
+3. Keep the same language (bash/python) unless the new requirements necessitate a change
+
+Output only the new script content, no markdown code blocks or explanations."""
+
+
+def build_tweak_prompt(original_prompt, current_script, tweak_instructions, changelog):
+    """Build the prompt for tweaking a script."""
+    return f"""You are an expert shell programmer. A user wants to tweak an existing script.
+
+ORIGINAL PROMPT THAT CREATED THE SCRIPT:
+{original_prompt}
+
+CURRENT SCRIPT:
+{current_script}
+
+USER'S TWEAK INSTRUCTIONS:
+{tweak_instructions}
+
+EXISTING CHANGELOG:
+{changelog if changelog else "(none)"}
+
+Your task:
+1. First, mentally update the original prompt based on the user's tweak instructions
+2. Then generate an improved version of the script based on that updated prompt
+3. Maintain backwards compatibility where possible
+4. Keep the same language (bash/python) unless the changes necessitate otherwise
+
+Output only the new script content, no markdown code blocks or explanations."""
+
+
+def embed_prompt_in_script(script_content, prompt, changelog=""):
+    """Embed the prompt in a script for later retrieval."""
+    if script_content.startswith("#!/usr/bin/env python") or \
+       script_content.startswith("#!/usr/bin/python"):
+        # Python script - embed as multiline string
+        escaped_prompt = prompt.replace("'''", "\\'\\'\\'")
+        escaped_changelog = changelog.replace("'''", "\\'\\'\\'")
+        embed = f'''
+# SHELP_PROMPT_START
+# This is the prompt that created this script. Do not modify manually.
+# To improve this script, use: shelp --improve <this_file>
+SHELP_PROMPT = r\'\'\'{escaped_prompt}\'\'\'
+# SHELP_PROMPT_END
+
+# SHELP_CHANGELOG_START
+SHELP_CHANGELOG = r\'\'\'{escaped_changelog}\'\'\'
+# SHELP_CHANGELOG_END
+'''
+        # Insert after shebang
+        lines = script_content.split("\n", 1)
+        if len(lines) > 1:
+            return lines[0] + "\n" + embed + "\n" + lines[1]
+        return script_content + "\n" + embed
+    else:
+        # Bash script - embed as comments
+        escaped_prompt = prompt.replace('"', '\\"')
+        escaped_changelog = changelog.replace('"', '\\"')
+        embed = f'''
+# SHELP_PROMPT_START
+# PROMPT: """{escaped_prompt}"""
+# SHELP_PROMPT_END
+
+# SHELP_CHANGELOG_START
+# CHANGELOG: """{escaped_changelog}"""
+# SHELP_CHANGELOG_END
+'''
+        lines = script_content.split("\n", 1)
+        if len(lines) > 1:
+            return lines[0] + "\n" + embed + "\n" + lines[1]
+        return script_content + "\n" + embed
+
+
+def strip_embedded_prompt(script_content):
+    """Remove embedded prompt from script for display."""
+    # Remove Python-style embedding
+    script_content = re.sub(
+        r'\n# SHELP_PROMPT_START\n.*?# SHELP_PROMPT_END\n',
+        '\n',
+        script_content,
+        flags=re.DOTALL
+    )
+    script_content = re.sub(
+        r'\n# SHELP_CHANGELOG_START\n.*?# SHELP_CHANGELOG_END\n',
+        '\n',
+        script_content,
+        flags=re.DOTALL
+    )
+    # Clean up multiple blank lines
+    script_content = re.sub(r'\n{3,}', '\n\n', script_content)
+    return script_content
+
+
+def confirm_script(script_content, prompt):
+    """Show script to user and confirm it's OK. Returns (confirmed, new_prompt)."""
+    display_script = strip_embedded_prompt(script_content)
+    print("\n" + "=" * 60)
+    print("Generated script:")
+    print("=" * 60)
+    print(display_script)
+    print("=" * 60)
+
+    response = input("\nDoes this look OK? [Y/n/e(dit prompt)] ").strip().lower()
+    if response in ("", "y", "yes"):
+        return True, prompt
+    elif response in ("e", "edit"):
+        new_prompt = open_in_editor(prompt)
+        if new_prompt.strip() == prompt.strip():
+            print("Prompt unchanged. Aborting.")
+            return False, None
+        return None, new_prompt  # Signal to regenerate
+    else:
+        print("Aborting.")
+        return False, None
+
+
+def generate_oneliner(args):
+    """Generate a one-liner command."""
+    user_request = " ".join(args.prompt)
+    prompt = build_oneliner_prompt(user_request)
+    result = call_claude(prompt)
+    print(result)
+
+
+def generate_script(args):
+    """Generate a full script with -o option."""
+    output_file = args.output
+    user_request = " ".join(args.prompt)
+    language_hint = get_language_hint(output_file)
+
+    prompt = build_script_prompt(user_request, language_hint)
+
+    while True:
+        script = call_claude(prompt)
+        script_with_prompt = embed_prompt_in_script(script, user_request)
+
+        confirmed, new_prompt = confirm_script(script_with_prompt, user_request)
+        if confirmed is True:
+            # Write the file
+            output_path = Path(output_file)
+            output_path.write_text(script_with_prompt)
+            output_path.chmod(0o755)
+            print(f"\n✓ Script written to {output_file}")
+            break
+        elif confirmed is False:
+            break
+        else:
+            # Regenerate with new prompt
+            user_request = new_prompt
+            prompt = build_script_prompt(user_request, language_hint)
+
+
+def compile_script(args):
+    """Compile from a -PROMPT.md file."""
+    prompt_file = Path(args.compile)
+    if not prompt_file.exists():
+        print(f"Error: {prompt_file} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Derive output name from prompt file
+    if prompt_file.name.endswith("-PROMPT.md"):
+        output_name = prompt_file.name[:-10]  # Remove -PROMPT.md
+    else:
+        print("Error: Compile file should be named <command>-PROMPT.md",
+              file=sys.stderr)
+        sys.exit(1)
+
+    output_path = prompt_file.parent / output_name
+    user_request = prompt_file.read_text()
+    language_hint = get_language_hint(output_name)
+
+    prompt = build_script_prompt(user_request, language_hint)
+
+    while True:
+        script = call_claude(prompt)
+        # Don't embed prompt for compile mode - use the PROMPT.md file
+
+        confirmed, new_prompt = confirm_script(script, user_request)
+        if confirmed is True:
+            output_path.write_text(script)
+            output_path.chmod(0o755)
+            print(f"\n✓ Script written to {output_path}")
+            break
+        elif confirmed is False:
+            break
+        else:
+            user_request = new_prompt
+            # Update the prompt file too
+            prompt_file.write_text(user_request)
+            prompt = build_script_prompt(user_request, language_hint)
+
+
+def improve_script(args):
+    """Improve an existing script."""
+    if args.improve == "" or args.improve is None:
+        # Improve shelp itself
+        script_path = get_real_script_path()
+    else:
+        script_path = Path(args.improve).resolve()
+
+    if not script_path.exists():
+        print(f"Error: {script_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    current_script = script_path.read_text()
+
+    # Get the prompt
+    original_prompt, prompt_type = get_prompt_for_file(script_path)
+    if not original_prompt:
+        print(f"Error: Could not find prompt for {script_path}", file=sys.stderr)
+        print("Make sure the file was created with shelp -o or --compile",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Get existing changelog
+    changelog = extract_changelog(script_path) or ""
+
+    # Open prompt in editor
+    new_prompt = open_in_editor(original_prompt)
+    if new_prompt.strip() == original_prompt.strip():
+        print("Prompt unchanged. Aborting.")
+        return
+
+    # Generate improved script
+    prompt = build_improve_prompt(original_prompt, current_script, new_prompt, changelog)
+
+    while True:
+        script = call_claude(prompt)
+
+        # Update changelog
+        import datetime
+        new_changelog = changelog + f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}] Improved\n"
+
+        if prompt_type == "embedded":
+            script = embed_prompt_in_script(script, new_prompt, new_changelog)
+
+        confirmed, edited_prompt = confirm_script(script, new_prompt)
+        if confirmed is True:
+            script_path.write_text(script)
+            script_path.chmod(0o755)
+            if prompt_type == "compile":
+                prompt_file = get_prompt_file_for_script(script_path)
+                prompt_file.write_text(new_prompt)
+            print(f"\n✓ Script improved: {script_path}")
+            break
+        elif confirmed is False:
+            break
+        else:
+            new_prompt = edited_prompt
+            prompt = build_improve_prompt(original_prompt, current_script,
+                                         new_prompt, changelog)
+
+
+def tweak_script(args):
+    """Tweak an existing script with minimal changes."""
+    if args.tweak == "" or args.tweak is None:
+        script_path = get_real_script_path()
+    else:
+        script_path = Path(args.tweak).resolve()
+
+    if not script_path.exists():
+        print(f"Error: {script_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    current_script = script_path.read_text()
+
+    original_prompt, prompt_type = get_prompt_for_file(script_path)
+    if not original_prompt:
+        print(f"Error: Could not find prompt for {script_path}", file=sys.stderr)
+        sys.exit(1)
+
+    changelog = extract_changelog(script_path) or ""
+
+    # Prepare tweak editor content
+    commented_prompt = "\n".join(f"# {line}" for line in original_prompt.split("\n"))
+    tweak_content = f"""
+
+
+# ============================================================================
+# TWEAK MODE: Describe what you'd like to change above this line.
+# The original prompt is shown below for reference (commented out).
+# Just write your tweak instructions above, then save and exit.
+# ============================================================================
+
+{commented_prompt}
+"""
+
+    edited = open_in_editor(tweak_content)
+
+    # Extract tweak instructions (everything before the separator)
+    separator = "# ============================================================================"
+    parts = edited.split(separator)
+    tweak_instructions = parts[0].strip()
+
+    if not tweak_instructions:
+        print("No tweak instructions provided. Aborting.")
+        return
+
+    # Generate tweaked script
+    prompt = build_tweak_prompt(original_prompt, current_script,
+                                tweak_instructions, changelog)
+
+    while True:
+        script = call_claude(prompt)
+
+        import datetime
+        new_changelog = changelog + f"\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}] Tweaked: {tweak_instructions[:50]}...\n"
+
+        if prompt_type == "embedded":
+            script = embed_prompt_in_script(script, original_prompt, new_changelog)
+
+        confirmed, _ = confirm_script(script, original_prompt)
+        if confirmed is True:
+            script_path.write_text(script)
+            script_path.chmod(0o755)
+            print(f"\n✓ Script tweaked: {script_path}")
+            break
+        elif confirmed is False:
+            break
+        else:
+            # For tweak, don't allow re-editing the prompt
+            print("Aborting.")
+            break
+
+
+def show_prompt(args):
+    """Show the prompt that created a file."""
+    if args.prompt_file == "" or args.prompt_file is None:
+        script_path = get_real_script_path()
+    else:
+        script_path = Path(args.prompt_file).resolve()
+
+    if not script_path.exists():
+        print(f"Error: {script_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    prompt, prompt_type = get_prompt_for_file(script_path)
+    if not prompt:
+        print(f"Error: Could not find prompt for {script_path}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Prompt for {script_path}:\n")
+    print("=" * 60)
+    print(prompt)
+    print("=" * 60)
+
+    changelog = extract_changelog(script_path)
+    if changelog:
+        print("\nChangelog:")
+        print(changelog)
+
+
+def install_shelp(args):
+    """Install shelp to a directory."""
+    install_dir = Path(args.install if args.install else "~/bin").expanduser()
+
+    # Create directory if it doesn't exist
+    if not install_dir.exists():
+        print(f"Creating directory: {install_dir}")
+        install_dir.mkdir(parents=True)
+
+    # Copy shelp to install directory
+    script_path = get_real_script_path()
+    dest_path = install_dir / "shelp"
+
+    import shutil
+    shutil.copy2(script_path, dest_path)
+    dest_path.chmod(0o755)
+
+    # Also copy prompt file if it exists
+    prompt_file = get_prompt_file_for_script(script_path)
+    if prompt_file.exists():
+        shutil.copy2(prompt_file, install_dir / prompt_file.name)
+
+    print(f"✓ Installed shelp to {dest_path}")
+
+    # Check if directory is in PATH
+    path_dirs = os.environ.get("PATH", "").split(":")
+    install_dir_str = str(install_dir)
+
+    if install_dir_str not in path_dirs:
+        bashrc = Path("~/.bashrc").expanduser()
+        response = input(f"\n{install_dir} is not in your PATH. Add it to ~/.bashrc? [Y/n] ")
+        if response.strip().lower() in ("", "y", "yes"):
+            with open(bashrc, "a") as f:
+                f.write(f'\n# Added by shelp\nexport PATH="$PATH:{install_dir_str}"\n')
+            print(f"✓ Added {install_dir} to PATH in ~/.bashrc")
+            print("  Run 'source ~/.bashrc' or start a new terminal to use shelp")
+    else:
+        print(f"✓ {install_dir} is already in your PATH")
+
+
+def show_help():
+    """Show detailed help with examples."""
+    help_text = """
+shelp - AI-Powered Shell Helper
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Generate shell commands and scripts using Claude AI.
+
+USAGE
+  shelp <description>              Generate a one-liner command
+  shelp -o <file> <description>    Generate and save a full script
+  shelp --compile <file>-PROMPT.md Compile a prompt file to a script
+  shelp --improve [file]           Improve an existing script's prompt
+  shelp --tweak [file]             Make small tweaks to a script
+  shelp --prompt [file]            Show the prompt that created a file
+  shelp --install [dir]            Install shelp to a directory
+
+EXAMPLES
+
+  Quick One-Liners:
+  ─────────────────
+  shelp find all python files modified today
+  shelp count lines of code in src directory excluding tests
+  shelp extract email addresses from input.txt
+  shelp convert CSV to JSON from stdin
+
+  Creating Scripts:
+  ─────────────────
+  shelp -o backup.sh backup my home directory to /mnt/backup daily
+  shelp -o analyze.py analyze apache logs and report top IPs
+  shelp -o deploy.sh deploy docker containers with rollback support
+
+  Compilation Mode:
+  ─────────────────
+  1. Create mycommand-PROMPT.md with your requirements
+  2. Run: shelp --compile mycommand-PROMPT.md
+  3. Edit and improve: shelp --improve mycommand
+
+  Improving Scripts:
+  ──────────────────
+  shelp --improve myscript.sh     # Edit the prompt, regenerate
+  shelp --tweak myscript.sh       # Quick tweaks without full rewrite
+  shelp --improve                 # Improve shelp itself!
+
+OPTIONS
+  -o, --output FILE    Write output to FILE (creates executable)
+  --compile FILE       Compile from FILE-PROMPT.md
+  --improve [FILE]     Improve existing script (default: shelp)
+  --tweak [FILE]       Tweak existing script
+  --prompt [FILE]      Show prompt for FILE (default: shelp)
+  --install [DIR]      Install to DIR (default: ~/bin)
+  --help               Show this help
+
+"""
+    print(help_text)
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-o", "--output", help="Output file for script")
+    parser.add_argument("--compile", help="Compile from PROMPT.md file")
+    parser.add_argument("--improve", nargs="?", const="",
+                        help="Improve a script")
+    parser.add_argument("--tweak", nargs="?", const="",
+                        help="Tweak a script")
+    parser.add_argument("--prompt", dest="prompt_file", nargs="?", const="",
+                        help="Show prompt for a file")
+    parser.add_argument("--install", nargs="?", const="",
+                        help="Install shelp")
+    parser.add_argument("--help", action="store_true", help="Show help")
+    parser.add_argument("prompt", nargs="*", help="The prompt/description")
+
+    args = parser.parse_args()
+
+    if args.help:
+        show_help()
+    elif args.install is not None:
+        install_shelp(args)
+    elif args.compile:
+        compile_script(args)
+    elif args.improve is not None:
+        improve_script(args)
+    elif args.tweak is not None:
+        tweak_script(args)
+    elif args.prompt_file is not None:
+        show_prompt(args)
+    elif args.output:
+        if not args.prompt:
+            print("Error: Please provide a description for the script",
+                  file=sys.stderr)
+            sys.exit(1)
+        generate_script(args)
+    elif args.prompt:
+        generate_oneliner(args)
+    else:
+        show_help()
+
+
+if __name__ == "__main__":
+    main()
