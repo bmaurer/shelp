@@ -16,6 +16,19 @@ cat foo | claude -p
 
 **Important:** The `claude` command outputs progress text to stderr. Only display stderr if claude returns a non-zero exit code.
 
+### Security: Isolated Temporary Directory
+
+When calling `claude` to generate output to a file:
+
+1. Create a dedicated temporary directory using `tempfile.mkdtemp(prefix="shelp_")` for each operation
+2. Place the output file in this isolated directory
+3. Grant Claude access ONLY to this isolated directory using `--add-dir <temp_dir>`
+4. Use `--allowed-tools Write,Read,Bash` to enable necessary tools
+5. Use `--permission-mode dontAsk` to bypass permission prompts
+6. Clean up the entire temporary directory after reading the output
+
+**Do NOT grant access to all of `/tmp`** - only to the specific isolated directory created for each operation. This limits the security exposure.
+
 ---
 
 ## Basic Usage (One-Liner Mode)

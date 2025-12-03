@@ -140,57 +140,67 @@ def update_prompt_file_changelog(prompt_file, new_prompt, changelog_entry):
 
 def call_claude(prompt, model=None, output_file=None):
     """Call claude CLI and return the output. Uses temp file for reliable output."""
-    # Create a temp file for claude to write to
-    if output_file is None:
-        fd, output_file = tempfile.mkstemp(suffix=".txt", prefix="shelp_output_")
-        os.close(fd)
-        cleanup_output = True
-    else:
-        cleanup_output = False
+    # Create a dedicated temp directory for this operation
+    # This limits Claude's access to only this isolated directory
+    temp_dir = tempfile.mkdtemp(prefix="shelp_")
+    cleanup_dir = True
 
-    # Build the prompt that instructs claude to write to the file
-    file_prompt = f"""{prompt}
+    try:
+        # Create a temp file for claude to write to in the isolated directory
+        if output_file is None:
+            output_file = os.path.join(temp_dir, "output.txt")
+            cleanup_output = True
+        else:
+            cleanup_output = False
+            cleanup_dir = False
+
+        # Build the prompt that instructs claude to write to the file
+        file_prompt = f"""{prompt}
 
 IMPORTANT: Write your output to this file: {output_file}
 Do not output the content to stdout - write it directly to the file.
 After writing, output only the text "DONE" to confirm completion."""
 
-    cmd = ["claude", "-p"]
-    if model:
-        cmd.extend(["--model", model])
+        cmd = ["claude", "-p"]
+        if model:
+            cmd.extend(["--model", model])
 
-    try:
-        result = subprocess.run(
-            cmd,
-            input=file_prompt,
-            capture_output=True,
-            text=True
-        )
-        if result.returncode != 0:
-            # Only show stderr on error
-            print(f"Error from claude: {result.stderr}", file=sys.stderr)
-            if cleanup_output and os.path.exists(output_file):
-                os.unlink(output_file)
-            sys.exit(1)
+        # Add directory permissions for only the isolated temp directory
+        cmd.extend(["--add-dir", temp_dir])
 
-        # Read the output from the file
+        # Allow Write and Read tools, and bypass permissions for temp file operations
+        cmd.extend(["--allowed-tools", "Write,Read,Bash"])
+        cmd.extend(["--permission-mode", "dontAsk"])
+
         try:
-            with open(output_file, 'r') as f:
-                content = f.read().strip()
+            result = subprocess.run(
+                cmd,
+                input=file_prompt,
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                # Only show stderr on error
+                print(f"Error from claude: {result.stderr}", file=sys.stderr)
+                sys.exit(1)
+
+            # Read the output from the file
+            try:
+                with open(output_file, 'r') as f:
+                    content = f.read().strip()
+            except FileNotFoundError:
+                # Fall back to stdout if file wasn't created
+                content = result.stdout.strip()
+
+            return content
         except FileNotFoundError:
-            # Fall back to stdout if file wasn't created
-            content = result.stdout.strip()
-
-        if cleanup_output and os.path.exists(output_file):
-            os.unlink(output_file)
-
-        return content
-    except FileNotFoundError:
-        print("Error: 'claude' command not found. Please install Claude CLI.",
-              file=sys.stderr)
-        if cleanup_output and os.path.exists(output_file):
-            os.unlink(output_file)
-        sys.exit(1)
+            print("Error: 'claude' command not found. Please install Claude CLI.",
+                  file=sys.stderr)
+            sys.exit(1)
+    finally:
+        # Clean up the isolated temp directory
+        if cleanup_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
 
 
 def open_in_editor(content):
